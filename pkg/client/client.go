@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strings"
 	"time"
@@ -96,12 +97,12 @@ func CallRevokeEndpoint(request interface{}, authFn interface{}, caller RevokeCa
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer resp.Body.Close()
 	// According to RFC7009 in section 2.2:
 	// "The content of the response body is ignored by the client as all
 	// necessary information is conveyed in the response code."
+	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		// TODO: switch to io.ReadAll when go1.15 support is retired
 		body, err := ioutil.ReadAll(resp.Body)
@@ -112,6 +113,33 @@ func CallRevokeEndpoint(request interface{}, authFn interface{}, caller RevokeCa
 		}
 	}
 	return nil
+}
+
+type EndSessionCaller interface {
+	GetEndSessionEndpoint() string
+	HttpClient() *http.Client
+}
+
+func CallEndSessionEndpoint(request interface{}, authFn interface{}, caller EndSessionCaller) (*url.URL, error) {
+	req, err := httphelper.FormRequest(caller.GetEndSessionEndpoint(), request, Encoder, authFn)
+	if err != nil {
+		return nil, err
+		return err
+	}
+	client := caller.HttpClient()
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	location, err := resp.Location()
+	if err != nil {
+		return nil, err
+	}
+	return location, nil
 }
 
 func NewSignerFromPrivateKeyByte(key []byte, keyID string) (jose.Signer, error) {
