@@ -1,8 +1,10 @@
 package oidc
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 )
 
 type errorType string
@@ -26,6 +28,11 @@ const (
 	SlowDown             errorType = "slow_down"
 	AccessDenied         errorType = "access_denied"
 	ExpiredToken         errorType = "expired_token"
+
+	// InvalidTarget error is returned by Token Exchange if
+	// the requested target or audience is invalid.
+	// [RFC 8693, Section 2.2.2: Error Response](https://www.rfc-editor.org/rfc/rfc8693#section-2.2.2)
+	InvalidTarget errorType = "invalid_target"
 )
 
 var (
@@ -111,6 +118,14 @@ var (
 			Description: "The \"device_code\" has expired.",
 		}
 	}
+
+	// Token exchange error
+	ErrInvalidTarget = func() *Error {
+		return &Error{
+			ErrorType:   InvalidTarget,
+			Description: "The requested audience or target is invalid.",
+		}
+	}
 )
 
 type Error struct {
@@ -119,6 +134,24 @@ type Error struct {
 	Description      string    `json:"error_description,omitempty" schema:"error_description,omitempty"`
 	State            string    `json:"state,omitempty" schema:"state,omitempty"`
 	redirectDisabled bool      `schema:"-"`
+	returnParent     bool      `schema:"-"`
+}
+
+func (e *Error) MarshalJSON() ([]byte, error) {
+	m := struct {
+		Error            errorType `json:"error"`
+		ErrorDescription string    `json:"error_description,omitempty"`
+		State            string    `json:"state,omitempty"`
+		Parent           string    `json:"parent,omitempty"`
+	}{
+		Error:            e.ErrorType,
+		ErrorDescription: e.Description,
+		State:            e.State,
+	}
+	if e.returnParent {
+		m.Parent = e.Parent.Error()
+	}
+	return json.Marshal(m)
 }
 
 func (e *Error) Error() string {
@@ -151,7 +184,19 @@ func (e *Error) WithParent(err error) *Error {
 	return e
 }
 
-func (e *Error) WithDescription(desc string, args ...interface{}) *Error {
+// WithReturnParentToClient allows returning the set parent error to the HTTP client.
+// Currently it only supports setting the parent inside JSON responses, not redirect URLs.
+// As Go errors don't unmarshal well, only the marshaller is implemented for the moment.
+//
+// Warning: parent errors may contain sensitive data or unwanted details about the server status.
+// Also, the `parent` field is not a standard error field and might confuse certain clients
+// that require fully compliant responses.
+func (e *Error) WithReturnParentToClient(b bool) *Error {
+	e.returnParent = b
+	return e
+}
+
+func (e *Error) WithDescription(desc string, args ...any) *Error {
 	e.Description = fmt.Sprintf(desc, args...)
 	return e
 }
@@ -170,4 +215,35 @@ func DefaultToServerError(err error, description string) *Error {
 		oauth.Parent = err
 	}
 	return oauth
+}
+
+func (e *Error) LogLevel() slog.Level {
+	level := slog.LevelWarn
+	if e.ErrorType == ServerError {
+		level = slog.LevelError
+	}
+	if e.ErrorType == AuthorizationPending {
+		level = slog.LevelInfo
+	}
+	return level
+}
+
+func (e *Error) LogValue() slog.Value {
+	attrs := make([]slog.Attr, 0, 5)
+	if e.Parent != nil {
+		attrs = append(attrs, slog.Any("parent", e.Parent))
+	}
+	if e.Description != "" {
+		attrs = append(attrs, slog.String("description", e.Description))
+	}
+	if e.ErrorType != "" {
+		attrs = append(attrs, slog.String("type", string(e.ErrorType)))
+	}
+	if e.State != "" {
+		attrs = append(attrs, slog.String("state", e.State))
+	}
+	if e.redirectDisabled {
+		attrs = append(attrs, slog.Bool("redirect_disabled", e.redirectDisabled))
+	}
+	return slog.GroupValue(attrs...)
 }

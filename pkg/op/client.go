@@ -7,8 +7,8 @@ import (
 	"net/url"
 	"time"
 
-	httphelper "github.com/zitadel/oidc/v2/pkg/http"
-	"github.com/zitadel/oidc/v2/pkg/oidc"
+	httphelper "github.com/zitadel/oidc/v3/pkg/http"
+	"github.com/zitadel/oidc/v3/pkg/oidc"
 )
 
 //go:generate go get github.com/dmarkham/enumer
@@ -63,6 +63,7 @@ type Client interface {
 // such as DevMode for the client being enabled.
 // https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest
 type HasRedirectGlobs interface {
+	Client
 	RedirectURIGlobs() []string
 	PostLogoutRedirectURIGlobs() []string
 }
@@ -87,10 +88,13 @@ var (
 )
 
 type ClientJWTProfile interface {
-	JWTProfileVerifier(context.Context) JWTProfileVerifier
+	JWTProfileVerifier(context.Context) *JWTProfileVerifier
 }
 
 func ClientJWTAuth(ctx context.Context, ca oidc.ClientAssertionParams, verifier ClientJWTProfile) (clientID string, err error) {
+	ctx, span := tracer.Start(ctx, "ClientJWTAuth")
+	defer span.End()
+
 	if ca.ClientAssertion == "" {
 		return "", oidc.ErrInvalidClient().WithParent(ErrNoClientCredentials)
 	}
@@ -103,6 +107,10 @@ func ClientJWTAuth(ctx context.Context, ca oidc.ClientAssertionParams, verifier 
 }
 
 func ClientBasicAuth(r *http.Request, storage Storage) (clientID string, err error) {
+	ctx, span := tracer.Start(r.Context(), "ClientBasicAuth")
+	r = r.WithContext(ctx)
+	defer span.End()
+
 	clientID, clientSecret, ok := r.BasicAuth()
 	if !ok {
 		return "", oidc.ErrInvalidClient().WithParent(ErrNoClientCredentials)
@@ -150,6 +158,10 @@ func ClientIDFromRequest(r *http.Request, p ClientProvider) (clientID string, au
 		return "", false, oidc.ErrInvalidRequest().WithDescription("cannot parse form").WithParent(err)
 	}
 
+	ctx, span := tracer.Start(r.Context(), "ClientIDFromRequest")
+	r = r.WithContext(ctx)
+	defer span.End()
+
 	data := new(clientData)
 	if err = p.Decoder().Decode(data, r.Form); err != nil {
 		return "", false, err
@@ -170,7 +182,7 @@ func ClientIDFromRequest(r *http.Request, p ClientProvider) (clientID string, au
 	}
 	// if the client did not send a Basic Auth Header, ignore the `ErrNoClientCredentials`
 	// but return other errors immediately
-	if err != nil && !errors.Is(err, ErrNoClientCredentials) {
+	if !errors.Is(err, ErrNoClientCredentials) {
 		return "", false, err
 	}
 
@@ -179,4 +191,11 @@ func ClientIDFromRequest(r *http.Request, p ClientProvider) (clientID string, au
 		return "", false, oidc.ErrInvalidClient().WithParent(ErrMissingClientID)
 	}
 	return data.ClientID, false, nil
+}
+
+type ClientCredentials struct {
+	ClientID            string `schema:"client_id"`
+	ClientSecret        string `schema:"client_secret"`    // Client secret from Basic auth or request body
+	ClientAssertion     string `schema:"client_assertion"` // JWT
+	ClientAssertionType string `schema:"client_assertion_type"`
 }

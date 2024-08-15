@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/square/go-jose.v2"
+	jose "github.com/go-jose/go-jose/v4"
 
-	str "github.com/zitadel/oidc/v2/pkg/strings"
+	str "github.com/zitadel/oidc/v3/pkg/strings"
 )
 
 type Claims interface {
@@ -57,14 +57,23 @@ var (
 	ErrNonceInvalid            = errors.New("nonce does not match")
 	ErrAcrInvalid              = errors.New("acr is invalid")
 	ErrAuthTimeNotPresent      = errors.New("claim `auth_time` of token is missing")
-	ErrAuthTimeToOld           = errors.New("auth time of token is to old")
+	ErrAuthTimeToOld           = errors.New("auth time of token is too old")
 	ErrAtHash                  = errors.New("at_hash does not correspond to access token")
 )
 
-type Verifier interface {
-	Issuer() string
-	MaxAgeIAT() time.Duration
-	Offset() time.Duration
+// Verifier caries configuration for the various token verification
+// functions. Use package specific constructor functions to know
+// which values need to be set.
+type Verifier struct {
+	Issuer            string
+	MaxAgeIAT         time.Duration
+	Offset            time.Duration
+	ClientID          string
+	SupportedSignAlgs []string
+	MaxAge            time.Duration
+	ACR               ACRVerifier
+	KeySet            KeySet
+	Nonce             func(ctx context.Context) string
 }
 
 // ACRVerifier specifies the function to be used by the `DefaultVerifier` for validating the acr claim
@@ -85,7 +94,7 @@ func DecryptToken(tokenString string) (string, error) {
 	return tokenString, nil // TODO: impl
 }
 
-func ParseToken(tokenString string, claims interface{}) ([]byte, error) {
+func ParseToken(tokenString string, claims any) ([]byte, error) {
 	parts := strings.Split(tokenString, ".")
 	if len(parts) != 3 {
 		return nil, fmt.Errorf("%w: token contains an invalid number of segments", ErrParse)
@@ -121,6 +130,11 @@ func CheckAudience(claims Claims, clientID string) error {
 	return nil
 }
 
+// CheckAuthorizedParty checks azp (authorized party) claim requirements.
+//
+// If the ID Token contains multiple audiences, the Client SHOULD verify that an azp Claim is present.
+// If an azp Claim is present, the Client SHOULD verify that its client_id is the Claim Value.
+// https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
 func CheckAuthorizedParty(claims Claims, clientID string) error {
 	if len(claims.GetAudience()) > 1 {
 		if claims.GetAuthorizedParty() == "" {
@@ -134,8 +148,13 @@ func CheckAuthorizedParty(claims Claims, clientID string) error {
 }
 
 func CheckSignature(ctx context.Context, token string, payload []byte, claims ClaimsSignature, supportedSigAlgs []string, set KeySet) error {
-	jws, err := jose.ParseSigned(token)
+	jws, err := jose.ParseSigned(token, toJoseSignatureAlgorithms(supportedSigAlgs))
 	if err != nil {
+		if strings.HasPrefix(err.Error(), "go-jose/go-jose: unexpected signature algorithm") {
+			// TODO(v4): we should wrap errors instead of returning static ones.
+			// This is a workaround so we keep returning the same error for now.
+			return ErrSignatureUnsupportedAlg
+		}
 		return ErrParse
 	}
 	if len(jws.Signatures) == 0 {
@@ -145,12 +164,6 @@ func CheckSignature(ctx context.Context, token string, payload []byte, claims Cl
 		return ErrSignatureMultiple
 	}
 	sig := jws.Signatures[0]
-	if len(supportedSigAlgs) == 0 {
-		supportedSigAlgs = []string{"RS256"}
-	}
-	if !str.Contains(supportedSigAlgs, sig.Header.Algorithm) {
-		return fmt.Errorf("%w: id token signed with unsupported algorithm, expected %q got %q", ErrSignatureUnsupportedAlg, supportedSigAlgs, sig.Header.Algorithm)
-	}
 
 	signedPayload, err := set.VerifySignature(ctx, jws)
 	if err != nil {
@@ -166,27 +179,39 @@ func CheckSignature(ctx context.Context, token string, payload []byte, claims Cl
 	return nil
 }
 
+// TODO(v4): Use the new jose.SignatureAlgorithm type directly, instead of string.
+func toJoseSignatureAlgorithms(algorithms []string) []jose.SignatureAlgorithm {
+	out := make([]jose.SignatureAlgorithm, len(algorithms))
+	for i := range algorithms {
+		out[i] = jose.SignatureAlgorithm(algorithms[i])
+	}
+	if len(out) == 0 {
+		out = append(out, jose.RS256, jose.ES256, jose.PS256)
+	}
+	return out
+}
+
 func CheckExpiration(claims Claims, offset time.Duration) error {
-	expiration := claims.GetExpiration().Round(time.Second)
-	if !time.Now().UTC().Add(offset).Before(expiration) {
+	expiration := claims.GetExpiration()
+	if !time.Now().Add(offset).Before(expiration) {
 		return ErrExpired
 	}
 	return nil
 }
 
 func CheckIssuedAt(claims Claims, maxAgeIAT, offset time.Duration) error {
-	issuedAt := claims.GetIssuedAt().Round(time.Second)
+	issuedAt := claims.GetIssuedAt()
 	if issuedAt.IsZero() {
 		return ErrIatMissing
 	}
-	nowWithOffset := time.Now().UTC().Add(offset).Round(time.Second)
+	nowWithOffset := time.Now().Add(offset).Round(time.Second)
 	if issuedAt.After(nowWithOffset) {
 		return fmt.Errorf("%w: (iat: %v, now with offset: %v)", ErrIatInFuture, issuedAt, nowWithOffset)
 	}
 	if maxAgeIAT == 0 {
 		return nil
 	}
-	maxAge := time.Now().UTC().Add(-maxAgeIAT).Round(time.Second)
+	maxAge := time.Now().Add(-maxAgeIAT).Round(time.Second)
 	if issuedAt.Before(maxAge) {
 		return fmt.Errorf("%w: must not be older than %v, but was %v (%v to old)", ErrIatToOld, maxAge, issuedAt, maxAge.Sub(issuedAt))
 	}
@@ -216,8 +241,8 @@ func CheckAuthTime(claims Claims, maxAge time.Duration) error {
 	if claims.GetAuthTime().IsZero() {
 		return ErrAuthTimeNotPresent
 	}
-	authTime := claims.GetAuthTime().Round(time.Second)
-	maxAuthTime := time.Now().UTC().Add(-maxAge).Round(time.Second)
+	authTime := claims.GetAuthTime()
+	maxAuthTime := time.Now().Add(-maxAge).Round(time.Second)
 	if authTime.Before(maxAuthTime) {
 		return fmt.Errorf("%w: must not be older than %v, but was %v (%v to old)", ErrAuthTimeToOld, maxAge, authTime, maxAuthTime.Sub(authTime))
 	}

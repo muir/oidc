@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	httphelper "github.com/zitadel/oidc/v2/pkg/http"
-	"github.com/zitadel/oidc/v2/pkg/oidc"
+	httphelper "github.com/zitadel/oidc/v3/pkg/http"
+	"github.com/zitadel/oidc/v3/pkg/oidc"
 )
 
 type TokenExchangeRequest interface {
@@ -24,12 +24,12 @@ type TokenExchangeRequest interface {
 	GetExchangeSubject() string
 	GetExchangeSubjectTokenType() oidc.TokenType
 	GetExchangeSubjectTokenIDOrToken() string
-	GetExchangeSubjectTokenClaims() map[string]interface{}
+	GetExchangeSubjectTokenClaims() map[string]any
 
 	GetExchangeActor() string
 	GetExchangeActorTokenType() oidc.TokenType
 	GetExchangeActorTokenIDOrToken() string
-	GetExchangeActorTokenClaims() map[string]interface{}
+	GetExchangeActorTokenClaims() map[string]any
 
 	SetCurrentScopes(scopes []string)
 	SetRequestedTokenType(tt oidc.TokenType)
@@ -40,12 +40,12 @@ type tokenExchangeRequest struct {
 	exchangeSubjectTokenIDOrToken string
 	exchangeSubjectTokenType      oidc.TokenType
 	exchangeSubject               string
-	exchangeSubjectTokenClaims    map[string]interface{}
+	exchangeSubjectTokenClaims    map[string]any
 
 	exchangeActorTokenIDOrToken string
 	exchangeActorTokenType      oidc.TokenType
 	exchangeActor               string
-	exchangeActorTokenClaims    map[string]interface{}
+	exchangeActorTokenClaims    map[string]any
 
 	resource           []string
 	audience           oidc.Audience
@@ -96,7 +96,7 @@ func (r *tokenExchangeRequest) GetExchangeSubjectTokenIDOrToken() string {
 	return r.exchangeSubjectTokenIDOrToken
 }
 
-func (r *tokenExchangeRequest) GetExchangeSubjectTokenClaims() map[string]interface{} {
+func (r *tokenExchangeRequest) GetExchangeSubjectTokenClaims() map[string]any {
 	return r.exchangeSubjectTokenClaims
 }
 
@@ -112,7 +112,7 @@ func (r *tokenExchangeRequest) GetExchangeActorTokenIDOrToken() string {
 	return r.exchangeActorTokenIDOrToken
 }
 
-func (r *tokenExchangeRequest) GetExchangeActorTokenClaims() map[string]interface{} {
+func (r *tokenExchangeRequest) GetExchangeActorTokenClaims() map[string]any {
 	return r.exchangeActorTokenClaims
 }
 
@@ -134,19 +134,23 @@ func (r *tokenExchangeRequest) SetSubject(subject string) {
 
 // TokenExchange handles the OAuth 2.0 token exchange grant ("urn:ietf:params:oauth:grant-type:token-exchange")
 func TokenExchange(w http.ResponseWriter, r *http.Request, exchanger Exchanger) {
+	ctx, span := tracer.Start(r.Context(), "TokenExchange")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	tokenExchangeReq, clientID, clientSecret, err := ParseTokenExchangeRequest(r, exchanger.Decoder())
 	if err != nil {
-		RequestError(w, r, err)
+		RequestError(w, r, err, exchanger.Logger())
 	}
 
 	tokenExchangeRequest, client, err := ValidateTokenExchangeRequest(r.Context(), tokenExchangeReq, clientID, clientSecret, exchanger)
 	if err != nil {
-		RequestError(w, r, err)
+		RequestError(w, r, err, exchanger.Logger())
 		return
 	}
 	resp, err := CreateTokenExchangeResponse(r.Context(), tokenExchangeRequest, client, exchanger)
 	if err != nil {
-		RequestError(w, r, err)
+		RequestError(w, r, err, exchanger.Logger())
 		return
 	}
 	httphelper.MarshalJSON(w, resp)
@@ -189,18 +193,15 @@ func ValidateTokenExchangeRequest(
 	clientID, clientSecret string,
 	exchanger Exchanger,
 ) (TokenExchangeRequest, Client, error) {
+	ctx, span := tracer.Start(ctx, "ValidateTokenExchangeRequest")
+	defer span.End()
+
 	if oidcTokenExchangeRequest.SubjectToken == "" {
 		return nil, nil, oidc.ErrInvalidRequest().WithDescription("subject_token missing")
 	}
 
 	if oidcTokenExchangeRequest.SubjectTokenType == "" {
 		return nil, nil, oidc.ErrInvalidRequest().WithDescription("subject_token_type missing")
-	}
-
-	storage := exchanger.Storage()
-	teStorage, ok := storage.(TokenExchangeStorage)
-	if !ok {
-		return nil, nil, oidc.ErrUnsupportedGrantType().WithDescription("token_exchange grant not supported")
 	}
 
 	client, err := AuthorizeTokenExchangeClient(ctx, clientID, clientSecret, exchanger)
@@ -220,21 +221,42 @@ func ValidateTokenExchangeRequest(
 		return nil, nil, oidc.ErrInvalidRequest().WithDescription("actor_token_type is not supported")
 	}
 
+	req, err := CreateTokenExchangeRequest(ctx, oidcTokenExchangeRequest, client, exchanger)
+	if err != nil {
+		return nil, nil, err
+	}
+	return req, client, nil
+}
+
+func CreateTokenExchangeRequest(
+	ctx context.Context,
+	oidcTokenExchangeRequest *oidc.TokenExchangeRequest,
+	client Client,
+	exchanger Exchanger,
+) (TokenExchangeRequest, error) {
+	ctx, span := tracer.Start(ctx, "CreateTokenExchangeRequest")
+	defer span.End()
+
+	teStorage, ok := exchanger.Storage().(TokenExchangeStorage)
+	if !ok {
+		return nil, unimplementedGrantError(oidc.GrantTypeTokenExchange)
+	}
+
 	exchangeSubjectTokenIDOrToken, exchangeSubject, exchangeSubjectTokenClaims, ok := GetTokenIDAndSubjectFromToken(ctx, exchanger,
 		oidcTokenExchangeRequest.SubjectToken, oidcTokenExchangeRequest.SubjectTokenType, false)
 	if !ok {
-		return nil, nil, oidc.ErrInvalidRequest().WithDescription("subject_token is invalid")
+		return nil, oidc.ErrInvalidRequest().WithDescription("subject_token is invalid")
 	}
 
 	var (
 		exchangeActorTokenIDOrToken, exchangeActor string
-		exchangeActorTokenClaims                   map[string]interface{}
+		exchangeActorTokenClaims                   map[string]any
 	)
 	if oidcTokenExchangeRequest.ActorToken != "" {
 		exchangeActorTokenIDOrToken, exchangeActor, exchangeActorTokenClaims, ok = GetTokenIDAndSubjectFromToken(ctx, exchanger,
 			oidcTokenExchangeRequest.ActorToken, oidcTokenExchangeRequest.ActorTokenType, true)
 		if !ok {
-			return nil, nil, oidc.ErrInvalidRequest().WithDescription("actor_token is invalid")
+			return nil, oidc.ErrInvalidRequest().WithDescription("actor_token is invalid")
 		}
 	}
 
@@ -258,17 +280,17 @@ func ValidateTokenExchangeRequest(
 		authTime:           time.Now(),
 	}
 
-	err = teStorage.ValidateTokenExchangeRequest(ctx, req)
+	err := teStorage.ValidateTokenExchangeRequest(ctx, req)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	err = teStorage.CreateTokenExchangeRequest(ctx, req)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	return req, client, nil
+	return req, nil
 }
 
 func GetTokenIDAndSubjectFromToken(
@@ -277,7 +299,10 @@ func GetTokenIDAndSubjectFromToken(
 	token string,
 	tokenType oidc.TokenType,
 	isActor bool,
-) (tokenIDOrToken, subject string, claims map[string]interface{}, ok bool) {
+) (tokenIDOrToken, subject string, claims map[string]any, ok bool) {
+	ctx, span := tracer.Start(ctx, "GetTokenIDAndSubjectFromToken")
+	defer span.End()
+
 	switch tokenType {
 	case oidc.AccessTokenType:
 		var accessTokenClaims *oidc.AccessTokenClaims
@@ -325,6 +350,9 @@ func GetTokenIDAndSubjectFromToken(
 
 // AuthorizeTokenExchangeClient authorizes a client by validating the client_id and client_secret
 func AuthorizeTokenExchangeClient(ctx context.Context, clientID, clientSecret string, exchanger Exchanger) (client Client, err error) {
+	ctx, span := tracer.Start(ctx, "AuthorizeTokenExchangeClient")
+	defer span.End()
+
 	if err := AuthorizeClientIDSecret(ctx, clientID, clientSecret, exchanger.Storage()); err != nil {
 		return nil, err
 	}
@@ -343,6 +371,8 @@ func CreateTokenExchangeResponse(
 	client Client,
 	creator TokenCreator,
 ) (_ *oidc.TokenExchangeResponse, err error) {
+	ctx, span := tracer.Start(ctx, "CreateTokenExchangeResponse")
+	defer span.End()
 
 	var (
 		token, refreshToken, tokenType string

@@ -16,8 +16,9 @@ import (
 	"github.com/muhlemmer/gu"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/zitadel/oidc/v2/pkg/oidc"
-	"github.com/zitadel/oidc/v2/pkg/op"
+	"github.com/zitadel/oidc/v3/example/server/storage"
+	"github.com/zitadel/oidc/v3/pkg/oidc"
+	"github.com/zitadel/oidc/v3/pkg/op"
 )
 
 func Test_deviceAuthorizationHandler(t *testing.T) {
@@ -319,7 +320,7 @@ func BenchmarkNewUserCode(b *testing.B) {
 }
 
 func TestDeviceAccessToken(t *testing.T) {
-	storage := testProvider.Storage().(op.DeviceAuthorizationStorage)
+	storage := testProvider.Storage().(*storage.Storage)
 	storage.StoreDeviceAuthorization(context.Background(), "native", "qwerty", "yuiop", time.Now().Add(time.Minute), []string{"foo"})
 	storage.CompleteDeviceAuthorization(context.Background(), "yuiop", "tim")
 
@@ -344,7 +345,7 @@ func TestDeviceAccessToken(t *testing.T) {
 func TestCheckDeviceAuthorizationState(t *testing.T) {
 	now := time.Now()
 
-	storage := testProvider.Storage().(op.DeviceAuthorizationStorage)
+	storage := testProvider.Storage().(*storage.Storage)
 	storage.StoreDeviceAuthorization(context.Background(), "native", "pending", "pending", now.Add(time.Minute), []string{"foo"})
 	storage.StoreDeviceAuthorization(context.Background(), "native", "denied", "denied", now.Add(time.Minute), []string{"foo"})
 	storage.StoreDeviceAuthorization(context.Background(), "native", "completed", "completed", now.Add(time.Minute), []string{"foo"})
@@ -449,6 +450,99 @@ func TestCheckDeviceAuthorizationState(t *testing.T) {
 			got, err := op.CheckDeviceAuthorizationState(tt.args.ctx, tt.args.clientID, tt.args.deviceCode, testProvider)
 			require.ErrorIs(t, err, tt.wantErr)
 			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestCreateDeviceTokenResponse(t *testing.T) {
+	tests := []struct {
+		name             string
+		tokenRequest     op.TokenRequest
+		wantAccessToken  bool
+		wantRefreshToken bool
+		wantIDToken      bool
+		wantErr          bool
+	}{
+		{
+			name: "access token",
+			tokenRequest: &op.DeviceAuthorizationState{
+				ClientID: "client1",
+				Subject:  "id1",
+				AMR:      []string{"password"},
+				AuthTime: time.Now(),
+			},
+			wantAccessToken: true,
+		},
+		{
+			name: "access and refresh tokens",
+			tokenRequest: &op.DeviceAuthorizationState{
+				ClientID: "client1",
+				Subject:  "id1",
+				AMR:      []string{"password"},
+				AuthTime: time.Now(),
+				Scopes:   []string{oidc.ScopeOfflineAccess},
+			},
+			wantAccessToken:  true,
+			wantRefreshToken: true,
+		},
+		{
+			name: "access and id token",
+			tokenRequest: &op.DeviceAuthorizationState{
+				ClientID: "client1",
+				Subject:  "id1",
+				AMR:      []string{"password"},
+				AuthTime: time.Now(),
+				Scopes:   []string{oidc.ScopeOpenID},
+			},
+			wantAccessToken: true,
+			wantIDToken:     true,
+		},
+		{
+			name: "access, refresh and id token",
+			tokenRequest: &op.DeviceAuthorizationState{
+				ClientID: "client1",
+				Subject:  "id1",
+				AMR:      []string{"password"},
+				AuthTime: time.Now(),
+				Scopes:   []string{oidc.ScopeOfflineAccess, oidc.ScopeOpenID},
+			},
+			wantAccessToken:  true,
+			wantRefreshToken: true,
+			wantIDToken:      true,
+		},
+		{
+			name: "id token creation error",
+			tokenRequest: &op.DeviceAuthorizationState{
+				ClientID: "client1",
+				Subject:  "foobar",
+				AMR:      []string{"password"},
+				AuthTime: time.Now(),
+				Scopes:   []string{oidc.ScopeOfflineAccess, oidc.ScopeOpenID},
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := testProvider.Storage().GetClientByClientID(context.Background(), "native")
+			require.NoError(t, err)
+
+			got, err := op.CreateDeviceTokenResponse(context.Background(), tt.tokenRequest, testProvider, client)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.InDelta(t, 300, got.ExpiresIn, 2)
+			if tt.wantAccessToken {
+				assert.NotEmpty(t, got.AccessToken, "access token")
+			}
+			if tt.wantRefreshToken {
+				assert.NotEmpty(t, got.RefreshToken, "refresh token")
+			}
+			if tt.wantIDToken {
+				assert.NotEmpty(t, got.IDToken, "id token")
+			}
 		})
 	}
 }

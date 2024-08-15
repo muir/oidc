@@ -4,9 +4,9 @@ import (
 	"context"
 	"net/http"
 
-	"gopkg.in/square/go-jose.v2"
+	jose "github.com/go-jose/go-jose/v4"
 
-	httphelper "github.com/zitadel/oidc/v2/pkg/http"
+	httphelper "github.com/zitadel/oidc/v3/pkg/http"
 )
 
 type KeyProvider interface {
@@ -20,6 +20,10 @@ func keysHandler(k KeyProvider) func(http.ResponseWriter, *http.Request) {
 }
 
 func Keys(w http.ResponseWriter, r *http.Request, k KeyProvider) {
+	ctx, span := tracer.Start(r.Context(), "Keys")
+	r = r.WithContext(ctx)
+	defer span.End()
+
 	keySet, err := k.KeySet(r.Context())
 	if err != nil {
 		httphelper.MarshalJSONWithStatus(w, err, http.StatusInternalServerError)

@@ -4,19 +4,20 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
-	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
+	"github.com/go-jose/go-jose/v4"
 	"github.com/google/uuid"
 	"golang.org/x/oauth2"
-	"gopkg.in/square/go-jose.v2"
+	"golang.org/x/oauth2/clientcredentials"
 
-	"github.com/zitadel/oidc/v2/pkg/client"
-	httphelper "github.com/zitadel/oidc/v2/pkg/http"
-	"github.com/zitadel/oidc/v2/pkg/oidc"
+	"github.com/zitadel/logging"
+	"github.com/zitadel/oidc/v3/pkg/client"
+	httphelper "github.com/zitadel/oidc/v3/pkg/http"
+	"github.com/zitadel/oidc/v3/pkg/oidc"
 )
 
 const (
@@ -59,38 +60,55 @@ type RelyingParty interface {
 	// UserinfoEndpoint returns the userinfo
 	UserinfoEndpoint() string
 
-	// GetDeviceAuthorizationEndpoint returns the enpoint which can
+	// GetDeviceAuthorizationEndpoint returns the endpoint which can
 	// be used to start a DeviceAuthorization flow.
 	GetDeviceAuthorizationEndpoint() string
 
-	// IDTokenVerifier returns the verifier interface used for oidc id_token verification
-	IDTokenVerifier() IDTokenVerifier
-	// ErrorHandler returns the handler used for callback errors
+	// IDTokenVerifier returns the verifier used for oidc id_token verification
+	IDTokenVerifier() *IDTokenVerifier
 
+	// ErrorHandler returns the handler used for callback errors
 	ErrorHandler() func(http.ResponseWriter, *http.Request, string, string, string)
+
+	// Logger from the context, or a fallback if set.
+	Logger(context.Context) (logger *slog.Logger, ok bool)
+}
+
+type HasUnauthorizedHandler interface {
+	// UnauthorizedHandler returns the handler used for unauthorized errors
+	UnauthorizedHandler() func(w http.ResponseWriter, r *http.Request, desc string, state string)
 }
 
 type ErrorHandler func(w http.ResponseWriter, r *http.Request, errorType string, errorDesc string, state string)
+type UnauthorizedHandler func(w http.ResponseWriter, r *http.Request, desc string, state string)
 
 var DefaultErrorHandler ErrorHandler = func(w http.ResponseWriter, r *http.Request, errorType string, errorDesc string, state string) {
 	http.Error(w, errorType+": "+errorDesc, http.StatusInternalServerError)
 }
+var DefaultUnauthorizedHandler UnauthorizedHandler = func(w http.ResponseWriter, r *http.Request, desc string, state string) {
+	http.Error(w, desc, http.StatusUnauthorized)
+}
 
 type relyingParty struct {
-	issuer            string
-	DiscoveryEndpoint string
-	endpoints         Endpoints
-	oauthConfig       *oauth2.Config
-	oauth2Only        bool
-	pkce              bool
+	issuer                      string
+	DiscoveryEndpoint           string
+	endpoints                   Endpoints
+	oauthConfig                 *oauth2.Config
+	oauth2Only                  bool
+	pkce                        bool
+	useSigningAlgsFromDiscovery bool
 
 	httpClient    *http.Client
 	cookieHandler *httphelper.CookieHandler
 
-	errorHandler    func(http.ResponseWriter, *http.Request, string, string, string)
-	idTokenVerifier IDTokenVerifier
-	verifierOpts    []VerifierOption
-	signer          jose.Signer
+	oauthAuthStyle oauth2.AuthStyle
+
+	errorHandler        func(http.ResponseWriter, *http.Request, string, string, string)
+	unauthorizedHandler func(http.ResponseWriter, *http.Request, string, string)
+	idTokenVerifier     *IDTokenVerifier
+	verifierOpts        []VerifierOption
+	signer              jose.Signer
+	logger              *slog.Logger
 }
 
 func (rp *relyingParty) OAuthConfig() *oauth2.Config {
@@ -137,7 +155,7 @@ func (rp *relyingParty) GetRevokeEndpoint() string {
 	return rp.endpoints.RevokeURL
 }
 
-func (rp *relyingParty) IDTokenVerifier() IDTokenVerifier {
+func (rp *relyingParty) IDTokenVerifier() *IDTokenVerifier {
 	if rp.idTokenVerifier == nil {
 		rp.idTokenVerifier = NewIDTokenVerifier(rp.issuer, rp.oauthConfig.ClientID, NewRemoteKeySet(rp.httpClient, rp.endpoints.JKWsURL), rp.verifierOpts...)
 	}
@@ -151,14 +169,31 @@ func (rp *relyingParty) ErrorHandler() func(http.ResponseWriter, *http.Request, 
 	return rp.errorHandler
 }
 
+func (rp *relyingParty) UnauthorizedHandler() func(http.ResponseWriter, *http.Request, string, string) {
+	if rp.unauthorizedHandler == nil {
+		rp.unauthorizedHandler = DefaultUnauthorizedHandler
+	}
+	return rp.unauthorizedHandler
+}
+
+func (rp *relyingParty) Logger(ctx context.Context) (logger *slog.Logger, ok bool) {
+	logger, ok = logging.FromContext(ctx)
+	if ok {
+		return logger, ok
+	}
+	return rp.logger, rp.logger != nil
+}
+
 // NewRelyingPartyOAuth creates an (OAuth2) RelyingParty with the given
 // OAuth2 Config and possible configOptions
 // it will use the AuthURL and TokenURL set in config
 func NewRelyingPartyOAuth(config *oauth2.Config, options ...Option) (RelyingParty, error) {
 	rp := &relyingParty{
-		oauthConfig: config,
-		httpClient:  httphelper.DefaultHTTPClient,
-		oauth2Only:  true,
+		oauthConfig:         config,
+		httpClient:          httphelper.DefaultHTTPClient,
+		oauth2Only:          true,
+		unauthorizedHandler: DefaultUnauthorizedHandler,
+		oauthAuthStyle:      oauth2.AuthStyleAutoDetect,
 	}
 
 	for _, optFunc := range options {
@@ -167,9 +202,12 @@ func NewRelyingPartyOAuth(config *oauth2.Config, options ...Option) (RelyingPart
 		}
 	}
 
+	rp.oauthConfig.Endpoint.AuthStyle = rp.oauthAuthStyle
+
 	// avoid races by calling these early
-	_ = rp.IDTokenVerifier() // sets idTokenVerifier
-	_ = rp.ErrorHandler()    // sets errorHandler
+	_ = rp.IDTokenVerifier()     // sets idTokenVerifier
+	_ = rp.ErrorHandler()        // sets errorHandler
+	_ = rp.UnauthorizedHandler() // sets unauthorizedHandler
 
 	return rp, nil
 }
@@ -177,7 +215,7 @@ func NewRelyingPartyOAuth(config *oauth2.Config, options ...Option) (RelyingPart
 // NewRelyingPartyOIDC creates an (OIDC) RelyingParty with the given
 // issuer, clientID, clientSecret, redirectURI, scopes and possible configOptions
 // it will run discovery on the provided issuer and use the found endpoints
-func NewRelyingPartyOIDC(issuer, clientID, clientSecret, redirectURI string, scopes []string, options ...Option) (RelyingParty, error) {
+func NewRelyingPartyOIDC(ctx context.Context, issuer, clientID, clientSecret, redirectURI string, scopes []string, options ...Option) (RelyingParty, error) {
 	rp := &relyingParty{
 		issuer: issuer,
 		oauthConfig: &oauth2.Config{
@@ -186,8 +224,9 @@ func NewRelyingPartyOIDC(issuer, clientID, clientSecret, redirectURI string, sco
 			RedirectURL:  redirectURI,
 			Scopes:       scopes,
 		},
-		httpClient: httphelper.DefaultHTTPClient,
-		oauth2Only: false,
+		httpClient:     httphelper.DefaultHTTPClient,
+		oauth2Only:     false,
+		oauthAuthStyle: oauth2.AuthStyleAutoDetect,
 	}
 
 	for _, optFunc := range options {
@@ -195,17 +234,25 @@ func NewRelyingPartyOIDC(issuer, clientID, clientSecret, redirectURI string, sco
 			return nil, err
 		}
 	}
-	discoveryConfiguration, err := client.Discover(rp.issuer, rp.httpClient, rp.DiscoveryEndpoint)
+	ctx = logCtxWithRPData(ctx, rp, "function", "NewRelyingPartyOIDC")
+	discoveryConfiguration, err := client.Discover(ctx, rp.issuer, rp.httpClient, rp.DiscoveryEndpoint)
 	if err != nil {
 		return nil, err
+	}
+	if rp.useSigningAlgsFromDiscovery {
+		rp.verifierOpts = append(rp.verifierOpts, WithSupportedSigningAlgorithms(discoveryConfiguration.IDTokenSigningAlgValuesSupported...))
 	}
 	endpoints := GetEndpoints(discoveryConfiguration)
 	rp.oauthConfig.Endpoint = endpoints.Endpoint
 	rp.endpoints = endpoints
 
+	rp.oauthConfig.Endpoint.AuthStyle = rp.oauthAuthStyle
+	rp.endpoints.Endpoint.AuthStyle = rp.oauthAuthStyle
+
 	// avoid races by calling these early
-	_ = rp.IDTokenVerifier() // sets idTokenVerifier
-	_ = rp.ErrorHandler()    // sets errorHandler
+	_ = rp.IDTokenVerifier()     // sets idTokenVerifier
+	_ = rp.ErrorHandler()        // sets errorHandler
+	_ = rp.UnauthorizedHandler() // sets unauthorizedHandler
 
 	return rp, nil
 }
@@ -254,6 +301,20 @@ func WithErrorHandler(errorHandler ErrorHandler) Option {
 	}
 }
 
+func WithUnauthorizedHandler(unauthorizedHandler UnauthorizedHandler) Option {
+	return func(rp *relyingParty) error {
+		rp.unauthorizedHandler = unauthorizedHandler
+		return nil
+	}
+}
+
+func WithAuthStyle(oauthAuthStyle oauth2.AuthStyle) Option {
+	return func(rp *relyingParty) error {
+		rp.oauthAuthStyle = oauthAuthStyle
+		return nil
+	}
+}
+
 func WithVerifierOpts(opts ...VerifierOption) Option {
 	return func(rp *relyingParty) error {
 		rp.verifierOpts = opts
@@ -278,6 +339,24 @@ func WithJWTProfile(signerFromKey SignerFromKey) Option {
 			return err
 		}
 		rp.signer = signer
+		return nil
+	}
+}
+
+// WithLogger sets a logger that is used
+// in case the request context does not contain a logger.
+func WithLogger(logger *slog.Logger) Option {
+	return func(rp *relyingParty) error {
+		rp.logger = logger
+		return nil
+	}
+}
+
+// WithSigningAlgsFromDiscovery appends the [WithSupportedSigningAlgorithms] option to the Verifier Options.
+// The algorithms returned in the `id_token_signing_alg_values_supported` from the discovery response will be set.
+func WithSigningAlgsFromDiscovery() Option {
+	return func(rp *relyingParty) error {
+		rp.useSigningAlgsFromDiscovery = true
 		return nil
 	}
 }
@@ -310,26 +389,6 @@ func SignerFromKeyAndKeyID(key []byte, keyID string) SignerFromKey {
 	}
 }
 
-// Discover calls the discovery endpoint of the provided issuer and returns the found endpoints
-//
-// deprecated: use client.Discover
-func Discover(issuer string, httpClient *http.Client) (Endpoints, error) {
-	wellKnown := strings.TrimSuffix(issuer, "/") + oidc.DiscoveryEndpoint
-	req, err := http.NewRequest("GET", wellKnown, nil)
-	if err != nil {
-		return Endpoints{}, err
-	}
-	discoveryConfig := new(oidc.DiscoveryConfiguration)
-	err = httphelper.HttpRequest(httpClient, req, &discoveryConfig)
-	if err != nil {
-		return Endpoints{}, err
-	}
-	if discoveryConfig.Issuer != issuer {
-		return Endpoints{}, fmt.Errorf("%w: Expected: %s, got: %s", oidc.ErrIssuerInvalid, discoveryConfig.Issuer, issuer)
-	}
-	return GetEndpoints(discoveryConfig), nil
-}
-
 // AuthURL returns the auth request url
 // (wrapping the oauth2 `AuthCodeURL`)
 func AuthURL(state string, rp RelyingParty, opts ...AuthURLOpt) string {
@@ -342,7 +401,7 @@ func AuthURL(state string, rp RelyingParty, opts ...AuthURLOpt) string {
 
 // AuthURLHandler extends the `AuthURL` method with a http redirect handler
 // including handling setting cookie for secure `state` transfer.
-// Custom paramaters can optionally be set to the redirect URL.
+// Custom parameters can optionally be set to the redirect URL.
 func AuthURLHandler(stateFn func() string, rp RelyingParty, urlParam ...URLParamOpt) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		opts := make([]AuthURLOpt, len(urlParam))
@@ -352,13 +411,13 @@ func AuthURLHandler(stateFn func() string, rp RelyingParty, urlParam ...URLParam
 
 		state := stateFn()
 		if err := trySetStateCookie(w, state, rp); err != nil {
-			http.Error(w, "failed to create state cookie: "+err.Error(), http.StatusUnauthorized)
+			unauthorizedError(w, r, "failed to create state cookie: "+err.Error(), state, rp)
 			return
 		}
 		if rp.IsPKCE() {
 			codeChallenge, err := GenerateAndStoreCodeChallenge(w, rp)
 			if err != nil {
-				http.Error(w, "failed to create code challenge: "+err.Error(), http.StatusUnauthorized)
+				unauthorizedError(w, r, "failed to create code challenge: "+err.Error(), state, rp)
 				return
 			}
 			opts = append(opts, WithCodeChallenge(codeChallenge))
@@ -377,35 +436,73 @@ func GenerateAndStoreCodeChallenge(w http.ResponseWriter, rp RelyingParty) (stri
 	return oidc.NewSHACodeChallenge(codeVerifier), nil
 }
 
+// ErrMissingIDToken is returned when an id_token was expected,
+// but not received in the token response.
+var ErrMissingIDToken = errors.New("id_token missing")
+
+func verifyTokenResponse[C oidc.IDClaims](ctx context.Context, token *oauth2.Token, rp RelyingParty) (*oidc.Tokens[C], error) {
+	ctx, span := client.Tracer.Start(ctx, "verifyTokenResponse")
+	defer span.End()
+
+	if rp.IsOAuth2Only() {
+		return &oidc.Tokens[C]{Token: token}, nil
+	}
+	idTokenString, ok := token.Extra(idTokenKey).(string)
+	if !ok {
+		return &oidc.Tokens[C]{Token: token}, ErrMissingIDToken
+	}
+	idToken, err := VerifyTokens[C](ctx, token.AccessToken, idTokenString, rp.IDTokenVerifier())
+	if err != nil {
+		return nil, err
+	}
+	return &oidc.Tokens[C]{Token: token, IDTokenClaims: idToken, IDToken: idTokenString}, nil
+}
+
 // CodeExchange handles the oauth2 code exchange, extracting and validating the id_token
 // returning it parsed together with the oauth2 tokens (access, refresh)
 func CodeExchange[C oidc.IDClaims](ctx context.Context, code string, rp RelyingParty, opts ...CodeExchangeOpt) (tokens *oidc.Tokens[C], err error) {
+	ctx, codeExchangeSpan := client.Tracer.Start(ctx, "CodeExchange")
+	defer codeExchangeSpan.End()
+
+	ctx = logCtxWithRPData(ctx, rp, "function", "CodeExchange")
 	ctx = context.WithValue(ctx, oauth2.HTTPClient, rp.HttpClient())
 	codeOpts := make([]oauth2.AuthCodeOption, 0)
 	for _, opt := range opts {
 		codeOpts = append(codeOpts, opt()...)
 	}
 
+	ctx, oauthExchangeSpan := client.Tracer.Start(ctx, "OAuthExchange")
 	token, err := rp.OAuthConfig().Exchange(ctx, code, codeOpts...)
 	if err != nil {
 		return nil, err
 	}
+	oauthExchangeSpan.End()
+	return verifyTokenResponse[C](ctx, token, rp)
+}
 
-	if rp.IsOAuth2Only() {
-		return &oidc.Tokens[C]{Token: token}, nil
+// ClientCredentials requests an access token using the `client_credentials` grant,
+// as defined in [RFC 6749, section 4.4].
+//
+// As there is no user associated to the request an ID Token can never be returned.
+// Client Credentials are undefined in OpenID Connect and is a pure OAuth2 grant.
+// Furthermore the server SHOULD NOT return a refresh token.
+//
+// [RFC 6749, section 4.4]: https://datatracker.ietf.org/doc/html/rfc6749#section-4.4
+func ClientCredentials(ctx context.Context, rp RelyingParty, endpointParams url.Values) (token *oauth2.Token, err error) {
+	ctx = logCtxWithRPData(ctx, rp, "function", "ClientCredentials")
+	ctx, span := client.Tracer.Start(ctx, "ClientCredentials")
+	defer span.End()
+
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, rp.HttpClient())
+	config := clientcredentials.Config{
+		ClientID:       rp.OAuthConfig().ClientID,
+		ClientSecret:   rp.OAuthConfig().ClientSecret,
+		TokenURL:       rp.OAuthConfig().Endpoint.TokenURL,
+		Scopes:         rp.OAuthConfig().Scopes,
+		EndpointParams: endpointParams,
+		AuthStyle:      rp.OAuthConfig().Endpoint.AuthStyle,
 	}
-
-	idTokenString, ok := token.Extra(idTokenKey).(string)
-	if !ok {
-		return nil, errors.New("id_token missing")
-	}
-
-	idToken, err := VerifyTokens[C](ctx, token.AccessToken, idTokenString, rp.IDTokenVerifier())
-	if err != nil {
-		return nil, err
-	}
-
-	return &oidc.Tokens[C]{Token: token, IDTokenClaims: idToken, IDToken: idTokenString}, nil
+	return config.Token(ctx)
 }
 
 type CodeExchangeCallback[C oidc.IDClaims] func(w http.ResponseWriter, r *http.Request, tokens *oidc.Tokens[C], state string, rp RelyingParty)
@@ -413,17 +510,20 @@ type CodeExchangeCallback[C oidc.IDClaims] func(w http.ResponseWriter, r *http.R
 // CodeExchangeHandler extends the `CodeExchange` method with a http handler
 // including cookie handling for secure `state` transfer
 // and optional PKCE code verifier checking.
-// Custom paramaters can optionally be set to the token URL.
+// Custom parameters can optionally be set to the token URL.
 func CodeExchangeHandler[C oidc.IDClaims](callback CodeExchangeCallback[C], rp RelyingParty, urlParam ...URLParamOpt) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, span := client.Tracer.Start(r.Context(), "CodeExchangeHandler")
+		r = r.WithContext(ctx)
+		defer span.End()
+
 		state, err := tryReadStateCookie(w, r, rp)
 		if err != nil {
-			http.Error(w, "failed to get state: "+err.Error(), http.StatusUnauthorized)
+			unauthorizedError(w, r, "failed to get state: "+err.Error(), state, rp)
 			return
 		}
-		params := r.URL.Query()
-		if params.Get("error") != "" {
-			rp.ErrorHandler()(w, r, params.Get("error"), params.Get("error_description"), state)
+		if errValue := r.FormValue("error"); errValue != "" {
+			rp.ErrorHandler()(w, r, errValue, r.FormValue("error_description"), state)
 			return
 		}
 		codeOpts := make([]CodeExchangeOpt, len(urlParam))
@@ -434,7 +534,7 @@ func CodeExchangeHandler[C oidc.IDClaims](callback CodeExchangeCallback[C], rp R
 		if rp.IsPKCE() {
 			codeVerifier, err := rp.CookieHandler().CheckCookie(r, pkceCode)
 			if err != nil {
-				http.Error(w, "failed to get code verifier: "+err.Error(), http.StatusUnauthorized)
+				unauthorizedError(w, r, "failed to get code verifier: "+err.Error(), state, rp)
 				return
 			}
 			codeOpts = append(codeOpts, WithCodeVerifier(codeVerifier))
@@ -443,49 +543,66 @@ func CodeExchangeHandler[C oidc.IDClaims](callback CodeExchangeCallback[C], rp R
 		if rp.Signer() != nil {
 			assertion, err := client.SignedJWTProfileAssertion(rp.OAuthConfig().ClientID, []string{rp.Issuer()}, time.Hour, rp.Signer())
 			if err != nil {
-				http.Error(w, "failed to build assertion: "+err.Error(), http.StatusUnauthorized)
+				unauthorizedError(w, r, "failed to build assertion: "+err.Error(), state, rp)
 				return
 			}
 			codeOpts = append(codeOpts, WithClientAssertionJWT(assertion))
 		}
-		tokens, err := CodeExchange[C](r.Context(), params.Get("code"), rp, codeOpts...)
+		tokens, err := CodeExchange[C](r.Context(), r.FormValue("code"), rp, codeOpts...)
 		if err != nil {
-			http.Error(w, "failed to exchange token: "+err.Error(), http.StatusUnauthorized)
+			unauthorizedError(w, r, "failed to exchange token: "+err.Error(), state, rp)
 			return
 		}
 		callback(w, r, tokens, state, rp)
 	}
 }
 
-type CodeExchangeUserinfoCallback[C oidc.IDClaims] func(w http.ResponseWriter, r *http.Request, tokens *oidc.Tokens[C], state string, provider RelyingParty, info *oidc.UserInfo)
+type SubjectGetter interface {
+	GetSubject() string
+}
+
+type CodeExchangeUserinfoCallback[C oidc.IDClaims, U SubjectGetter] func(w http.ResponseWriter, r *http.Request, tokens *oidc.Tokens[C], state string, provider RelyingParty, info U)
 
 // UserinfoCallback wraps the callback function of the CodeExchangeHandler
 // and calls the userinfo endpoint with the access token
 // on success it will pass the userinfo into its callback function as well
-func UserinfoCallback[C oidc.IDClaims](f CodeExchangeUserinfoCallback[C]) CodeExchangeCallback[C] {
+func UserinfoCallback[C oidc.IDClaims, U SubjectGetter](f CodeExchangeUserinfoCallback[C, U]) CodeExchangeCallback[C] {
 	return func(w http.ResponseWriter, r *http.Request, tokens *oidc.Tokens[C], state string, rp RelyingParty) {
-		info, err := Userinfo(tokens.AccessToken, tokens.TokenType, tokens.IDTokenClaims.GetSubject(), rp)
+		ctx, span := client.Tracer.Start(r.Context(), "UserinfoCallback")
+		r = r.WithContext(ctx)
+		defer span.End()
+
+		info, err := Userinfo[U](r.Context(), tokens.AccessToken, tokens.TokenType, tokens.IDTokenClaims.GetSubject(), rp)
 		if err != nil {
-			http.Error(w, "userinfo failed: "+err.Error(), http.StatusUnauthorized)
+			unauthorizedError(w, r, "userinfo failed: "+err.Error(), state, rp)
 			return
 		}
 		f(w, r, tokens, state, rp, info)
 	}
 }
 
-// Userinfo will call the OIDC Userinfo Endpoint with the provided token
-func Userinfo(token, tokenType, subject string, rp RelyingParty) (*oidc.UserInfo, error) {
-	req, err := http.NewRequest("GET", rp.UserinfoEndpoint(), nil)
+// Userinfo will call the OIDC [UserInfo] Endpoint with the provided token and returns
+// the response in an instance of type U.
+// [*oidc.UserInfo] can be used as a good example, or use a custom type if type-safe
+// access to custom claims is needed.
+//
+// [UserInfo]: https://openid.net/specs/openid-connect-core-1_0.html#UserInfo
+func Userinfo[U SubjectGetter](ctx context.Context, token, tokenType, subject string, rp RelyingParty) (userinfo U, err error) {
+	var nilU U
+	ctx = logCtxWithRPData(ctx, rp, "function", "Userinfo")
+	ctx, span := client.Tracer.Start(ctx, "Userinfo")
+	defer span.End()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rp.UserinfoEndpoint(), nil)
 	if err != nil {
-		return nil, err
+		return nilU, err
 	}
 	req.Header.Set("authorization", tokenType+" "+token)
-	userinfo := new(oidc.UserInfo)
 	if err := httphelper.HttpRequest(rp.HttpClient(), req, &userinfo); err != nil {
-		return nil, err
+		return nilU, err
 	}
-	if userinfo.Subject != subject {
-		return nil, ErrUserInfoSubNotMatching
+	if userinfo.GetSubject() != subject {
+		return nilU, ErrUserInfoSubNotMatching
 	}
 	return userinfo, nil
 }
@@ -526,9 +643,8 @@ type Endpoints struct {
 func GetEndpoints(discoveryConfig *oidc.DiscoveryConfiguration) Endpoints {
 	return Endpoints{
 		Endpoint: oauth2.Endpoint{
-			AuthURL:   discoveryConfig.AuthorizationEndpoint,
-			AuthStyle: oauth2.AuthStyleAutoDetect,
-			TokenURL:  discoveryConfig.TokenEndpoint,
+			AuthURL:  discoveryConfig.AuthorizationEndpoint,
+			TokenURL: discoveryConfig.TokenEndpoint,
 		},
 		IntrospectURL:          discoveryConfig.IntrospectionEndpoint,
 		UserinfoURL:            discoveryConfig.UserinfoEndpoint,
@@ -539,7 +655,7 @@ func GetEndpoints(discoveryConfig *oidc.DiscoveryConfiguration) Endpoints {
 	}
 }
 
-// withURLParam sets custom url paramaters.
+// withURLParam sets custom url parameters.
 // This is the generalized, unexported, function used by both
 // URLParamOpt and AuthURLOpt.
 func withURLParam(key, value string) func() []oauth2.AuthCodeOption {
@@ -554,7 +670,7 @@ func withURLParam(key, value string) func() []oauth2.AuthCodeOption {
 // This is the generalized, unexported, function used by both
 // URLParamOpt and AuthURLOpt.
 func withPrompt(prompt ...string) func() []oauth2.AuthCodeOption {
-	return withURLParam("prompt", oidc.SpaceDelimitedArray(prompt).Encode())
+	return withURLParam("prompt", oidc.SpaceDelimitedArray(prompt).String())
 }
 
 type URLParamOpt func() []oauth2.AuthCodeOption
@@ -618,19 +734,26 @@ func (t tokenEndpointCaller) TokenEndpoint() string {
 
 type RefreshTokenRequest struct {
 	RefreshToken        string                   `schema:"refresh_token"`
-	Scopes              oidc.SpaceDelimitedArray `schema:"scope"`
-	ClientID            string                   `schema:"client_id"`
-	ClientSecret        string                   `schema:"client_secret"`
-	ClientAssertion     string                   `schema:"client_assertion"`
-	ClientAssertionType string                   `schema:"client_assertion_type"`
+	Scopes              oidc.SpaceDelimitedArray `schema:"scope,omitempty"`
+	ClientID            string                   `schema:"client_id,omitempty"`
+	ClientSecret        string                   `schema:"client_secret,omitempty"`
+	ClientAssertion     string                   `schema:"client_assertion,omitempty"`
+	ClientAssertionType string                   `schema:"client_assertion_type,omitempty"`
 	GrantType           oidc.GrantType           `schema:"grant_type"`
 }
 
-// RefreshAccessToken performs a token refresh. If it doesn't error, it will always
+// RefreshTokens performs a token refresh. If it doesn't error, it will always
 // provide a new AccessToken. It may provide a new RefreshToken, and if it does, then
-// the old one should be considered invalid. It may also provide a new IDToken. The
-// new IDToken can be retrieved with token.Extra("id_token").
-func RefreshAccessToken(rp RelyingParty, refreshToken, clientAssertion, clientAssertionType string) (*oauth2.Token, error) {
+// the old one should be considered invalid.
+//
+// In case the RP is not OAuth2 only and an IDToken was part of the response,
+// the IDToken and AccessToken will be verified
+// and the IDToken and IDTokenClaims fields will be populated in the returned object.
+func RefreshTokens[C oidc.IDClaims](ctx context.Context, rp RelyingParty, refreshToken, clientAssertion, clientAssertionType string) (*oidc.Tokens[C], error) {
+	ctx, span := client.Tracer.Start(ctx, "RefreshTokens")
+	defer span.End()
+
+	ctx = logCtxWithRPData(ctx, rp, "function", "RefreshTokens")
 	request := RefreshTokenRequest{
 		RefreshToken:        refreshToken,
 		Scopes:              rp.OAuthConfig().Scopes,
@@ -640,17 +763,31 @@ func RefreshAccessToken(rp RelyingParty, refreshToken, clientAssertion, clientAs
 		ClientAssertionType: clientAssertionType,
 		GrantType:           oidc.GrantTypeRefreshToken,
 	}
-	return client.CallTokenEndpoint(request, tokenEndpointCaller{RelyingParty: rp})
+	newToken, err := client.CallTokenEndpoint(ctx, request, tokenEndpointCaller{RelyingParty: rp})
+	if err != nil {
+		return nil, err
+	}
+	tokens, err := verifyTokenResponse[C](ctx, newToken, rp)
+	if err == nil || errors.Is(err, ErrMissingIDToken) {
+		// https://openid.net/specs/openid-connect-core-1_0.html#RefreshTokenResponse
+		// ...except that it might not contain an id_token.
+		return tokens, nil
+	}
+	return nil, err
 }
 
-func EndSession(rp RelyingParty, idToken, optionalRedirectURI, optionalState string) (*url.URL, error) {
+func EndSession(ctx context.Context, rp RelyingParty, idToken, optionalRedirectURI, optionalState string) (*url.URL, error) {
+	ctx = logCtxWithRPData(ctx, rp, "function", "EndSession")
+	ctx, span := client.Tracer.Start(ctx, "RefreshTokens")
+	defer span.End()
+
 	request := oidc.EndSessionRequest{
 		IdTokenHint:           idToken,
 		ClientID:              rp.OAuthConfig().ClientID,
 		PostLogoutRedirectURI: optionalRedirectURI,
 		State:                 optionalState,
 	}
-	return client.CallEndSessionEndpoint(request, nil, rp)
+	return client.CallEndSessionEndpoint(ctx, request, nil, rp)
 }
 
 // RevokeToken requires a RelyingParty that is also a client.RevokeCaller.  The RelyingParty
@@ -658,7 +795,10 @@ func EndSession(rp RelyingParty, idToken, optionalRedirectURI, optionalState str
 // NewRelyingPartyOAuth() does not.
 //
 // tokenTypeHint should be either "id_token" or "refresh_token".
-func RevokeToken(rp RelyingParty, token string, tokenTypeHint string) error {
+func RevokeToken(ctx context.Context, rp RelyingParty, token string, tokenTypeHint string) error {
+	ctx = logCtxWithRPData(ctx, rp, "function", "RevokeToken")
+	ctx, span := client.Tracer.Start(ctx, "RefreshTokens")
+	defer span.End()
 	request := client.RevokeRequest{
 		Token:         token,
 		TokenTypeHint: tokenTypeHint,
@@ -666,7 +806,15 @@ func RevokeToken(rp RelyingParty, token string, tokenTypeHint string) error {
 		ClientSecret:  rp.OAuthConfig().ClientSecret,
 	}
 	if rc, ok := rp.(client.RevokeCaller); ok && rc.GetRevokeEndpoint() != "" {
-		return client.CallRevokeEndpoint(request, nil, rc)
+		return client.CallRevokeEndpoint(ctx, request, nil, rc)
 	}
-	return fmt.Errorf("RelyingParty does not support RevokeCaller")
+	return ErrRelyingPartyNotSupportRevokeCaller
+}
+
+func unauthorizedError(w http.ResponseWriter, r *http.Request, desc string, state string, rp RelyingParty) {
+	if rp, ok := rp.(HasUnauthorizedHandler); ok {
+		rp.UnauthorizedHandler()(w, r, desc, state)
+		return
+	}
+	http.Error(w, desc, http.StatusUnauthorized)
 }

@@ -1,5 +1,9 @@
 package oidc
 
+import (
+	"log/slog"
+)
+
 const (
 	// ScopeOpenID defines the scope `openid`
 	// OpenID Connect requests MUST contain the `openid` scope value
@@ -44,6 +48,7 @@ const (
 
 	ResponseModeQuery    ResponseMode = "query"
 	ResponseModeFragment ResponseMode = "fragment"
+	ResponseModeFormPost ResponseMode = "form_post"
 
 	// PromptNone (`none`) disallows the Authorization Server to display any authentication or consent user interface pages.
 	// An error (login_required, interaction_required, ...) will be returned if the user is not already authenticated or consent is needed
@@ -77,13 +82,22 @@ type AuthRequest struct {
 	UILocales    Locales             `json:"ui_locales" schema:"ui_locales"`
 	IDTokenHint  string              `json:"id_token_hint" schema:"id_token_hint"`
 	LoginHint    string              `json:"login_hint" schema:"login_hint"`
-	ACRValues    []string            `json:"acr_values" schema:"acr_values"`
+	ACRValues    SpaceDelimitedArray `json:"acr_values" schema:"acr_values"`
 
 	CodeChallenge       string              `json:"code_challenge" schema:"code_challenge"`
 	CodeChallengeMethod CodeChallengeMethod `json:"code_challenge_method" schema:"code_challenge_method"`
 
 	// RequestParam enables OIDC requests to be passed in a single, self-contained parameter (as JWT, called Request Object)
 	RequestParam string `schema:"request"`
+}
+
+func (a *AuthRequest) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.Any("scopes", a.Scopes),
+		slog.String("response_type", string(a.ResponseType)),
+		slog.String("client_id", a.ClientID),
+		slog.String("redirect_uri", a.RedirectURI),
+	)
 }
 
 // GetRedirectURI returns the redirect_uri value for the ErrAuthRequest interface

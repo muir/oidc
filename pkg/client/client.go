@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,24 +10,32 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-jose/go-jose/v4"
+	"github.com/zitadel/logging"
+	"go.opentelemetry.io/otel"
 	"golang.org/x/oauth2"
-	"gopkg.in/square/go-jose.v2"
 
-	"github.com/zitadel/oidc/v2/pkg/crypto"
-	httphelper "github.com/zitadel/oidc/v2/pkg/http"
-	"github.com/zitadel/oidc/v2/pkg/oidc"
+	"github.com/zitadel/oidc/v3/pkg/crypto"
+	httphelper "github.com/zitadel/oidc/v3/pkg/http"
+	"github.com/zitadel/oidc/v3/pkg/oidc"
 )
 
-var Encoder = httphelper.Encoder(oidc.NewEncoder())
+var (
+	Encoder = httphelper.Encoder(oidc.NewEncoder())
+	Tracer  = otel.Tracer("github.com/zitadel/oidc/pkg/client")
+)
 
 // Discover calls the discovery endpoint of the provided issuer and returns its configuration
 // It accepts an optional argument "wellknownUrl" which can be used to overide the dicovery endpoint url
-func Discover(issuer string, httpClient *http.Client, wellKnownUrl ...string) (*oidc.DiscoveryConfiguration, error) {
+func Discover(ctx context.Context, issuer string, httpClient *http.Client, wellKnownUrl ...string) (*oidc.DiscoveryConfiguration, error) {
+	ctx, span := Tracer.Start(ctx, "Discover")
+	defer span.End()
+
 	wellKnown := strings.TrimSuffix(issuer, "/") + oidc.DiscoveryEndpoint
 	if len(wellKnownUrl) == 1 && wellKnownUrl[0] != "" {
 		wellKnown = wellKnownUrl[0]
 	}
-	req, err := http.NewRequest("GET", wellKnown, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wellKnown, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -37,6 +44,10 @@ func Discover(issuer string, httpClient *http.Client, wellKnownUrl ...string) (*
 	if err != nil {
 		return nil, err
 	}
+	if logger, ok := logging.FromContext(ctx); ok {
+		logger.Debug("discover", "config", discoveryConfig)
+	}
+
 	if discoveryConfig.Issuer != issuer {
 		return nil, oidc.ErrIssuerInvalid
 	}
@@ -48,12 +59,15 @@ type TokenEndpointCaller interface {
 	HttpClient() *http.Client
 }
 
-func CallTokenEndpoint(request interface{}, caller TokenEndpointCaller) (newToken *oauth2.Token, err error) {
-	return callTokenEndpoint(request, nil, caller)
+func CallTokenEndpoint(ctx context.Context, request any, caller TokenEndpointCaller) (newToken *oauth2.Token, err error) {
+	return callTokenEndpoint(ctx, request, nil, caller)
 }
 
-func callTokenEndpoint(request interface{}, authFn interface{}, caller TokenEndpointCaller) (newToken *oauth2.Token, err error) {
-	req, err := httphelper.FormRequest(caller.TokenEndpoint(), request, Encoder, authFn)
+func callTokenEndpoint(ctx context.Context, request any, authFn any, caller TokenEndpointCaller) (newToken *oauth2.Token, err error) {
+	ctx, span := Tracer.Start(ctx, "callTokenEndpoint")
+	defer span.End()
+
+	req, err := httphelper.FormRequest(ctx, caller.TokenEndpoint(), request, Encoder, authFn)
 	if err != nil {
 		return nil, err
 	}
@@ -80,8 +94,16 @@ type EndSessionCaller interface {
 	HttpClient() *http.Client
 }
 
-func CallEndSessionEndpoint(request interface{}, authFn interface{}, caller EndSessionCaller) (*url.URL, error) {
-	req, err := httphelper.FormRequest(caller.GetEndSessionEndpoint(), request, Encoder, authFn)
+func CallEndSessionEndpoint(ctx context.Context, request any, authFn any, caller EndSessionCaller) (*url.URL, error) {
+	ctx, span := Tracer.Start(ctx, "CallEndSessionEndpoint")
+	defer span.End()
+
+	endpoint := caller.GetEndSessionEndpoint()
+	if endpoint == "" {
+		return nil, fmt.Errorf("end session %w", ErrEndpointNotSet)
+	}
+
+	req, err := httphelper.FormRequest(ctx, endpoint, request, Encoder, authFn)
 	if err != nil {
 		return nil, err
 	}
@@ -123,8 +145,16 @@ type RevokeRequest struct {
 	ClientSecret  string `schema:"client_secret"`
 }
 
-func CallRevokeEndpoint(request interface{}, authFn interface{}, caller RevokeCaller) error {
-	req, err := httphelper.FormRequest(caller.GetRevokeEndpoint(), request, Encoder, authFn)
+func CallRevokeEndpoint(ctx context.Context, request any, authFn any, caller RevokeCaller) error {
+	ctx, span := Tracer.Start(ctx, "CallRevokeEndpoint")
+	defer span.End()
+
+	endpoint := caller.GetRevokeEndpoint()
+	if endpoint == "" {
+		return fmt.Errorf("revoke %w", ErrEndpointNotSet)
+	}
+
+	req, err := httphelper.FormRequest(ctx, endpoint, request, Encoder, authFn)
 	if err != nil {
 		return err
 	}
@@ -151,8 +181,11 @@ func CallRevokeEndpoint(request interface{}, authFn interface{}, caller RevokeCa
 	return nil
 }
 
-func CallTokenExchangeEndpoint(request interface{}, authFn interface{}, caller TokenEndpointCaller) (resp *oidc.TokenExchangeResponse, err error) {
-	req, err := httphelper.FormRequest(caller.TokenEndpoint(), request, Encoder, authFn)
+func CallTokenExchangeEndpoint(ctx context.Context, request any, authFn any, caller TokenEndpointCaller) (resp *oidc.TokenExchangeResponse, err error) {
+	ctx, span := Tracer.Start(ctx, "CallTokenExchangeEndpoint")
+	defer span.End()
+
+	req, err := httphelper.FormRequest(ctx, caller.TokenEndpoint(), request, Encoder, authFn)
 	if err != nil {
 		return nil, err
 	}
@@ -164,12 +197,12 @@ func CallTokenExchangeEndpoint(request interface{}, authFn interface{}, caller T
 }
 
 func NewSignerFromPrivateKeyByte(key []byte, keyID string) (jose.Signer, error) {
-	privateKey, err := crypto.BytesToPrivateKey(key)
+	privateKey, algorithm, err := crypto.BytesToPrivateKey(key)
 	if err != nil {
 		return nil, err
 	}
 	signingKey := jose.SigningKey{
-		Algorithm: jose.RS256,
+		Algorithm: algorithm,
 		Key:       &jose.JSONWebKey{Key: privateKey, KeyID: keyID},
 	}
 	return jose.NewSigner(signingKey, &jose.SignerOptions{})
@@ -192,8 +225,16 @@ type DeviceAuthorizationCaller interface {
 	HttpClient() *http.Client
 }
 
-func CallDeviceAuthorizationEndpoint(request *oidc.ClientCredentialsRequest, caller DeviceAuthorizationCaller) (*oidc.DeviceAuthorizationResponse, error) {
-	req, err := httphelper.FormRequest(caller.GetDeviceAuthorizationEndpoint(), request, Encoder, nil)
+func CallDeviceAuthorizationEndpoint(ctx context.Context, request *oidc.ClientCredentialsRequest, caller DeviceAuthorizationCaller, authFn any) (*oidc.DeviceAuthorizationResponse, error) {
+	ctx, span := Tracer.Start(ctx, "CallDeviceAuthorizationEndpoint")
+	defer span.End()
+
+	endpoint := caller.GetDeviceAuthorizationEndpoint()
+	if endpoint == "" {
+		return nil, fmt.Errorf("device authorization %w", ErrEndpointNotSet)
+	}
+
+	req, err := httphelper.FormRequest(ctx, endpoint, request, Encoder, authFn)
 	if err != nil {
 		return nil, err
 	}
@@ -214,7 +255,10 @@ type DeviceAccessTokenRequest struct {
 }
 
 func CallDeviceAccessTokenEndpoint(ctx context.Context, request *DeviceAccessTokenRequest, caller TokenEndpointCaller) (*oidc.AccessTokenResponse, error) {
-	req, err := httphelper.FormRequest(caller.TokenEndpoint(), request, Encoder, nil)
+	ctx, span := Tracer.Start(ctx, "CallDeviceAccessTokenEndpoint")
+	defer span.End()
+
+	req, err := httphelper.FormRequest(ctx, caller.TokenEndpoint(), request, Encoder, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -222,28 +266,17 @@ func CallDeviceAccessTokenEndpoint(ctx context.Context, request *DeviceAccessTok
 		req.SetBasicAuth(request.ClientID, request.ClientSecret)
 	}
 
-	httpResp, err := caller.HttpClient().Do(req)
-	if err != nil {
+	resp := new(oidc.AccessTokenResponse)
+	if err := httphelper.HttpRequest(caller.HttpClient(), req, &resp); err != nil {
 		return nil, err
 	}
-	defer httpResp.Body.Close()
-
-	resp := new(struct {
-		*oidc.AccessTokenResponse
-		*oidc.Error
-	})
-	if err = json.NewDecoder(httpResp.Body).Decode(resp); err != nil {
-		return nil, err
-	}
-
-	if httpResp.StatusCode == http.StatusOK {
-		return resp.AccessTokenResponse, nil
-	}
-
-	return nil, resp.Error
+	return resp, nil
 }
 
 func PollDeviceAccessTokenEndpoint(ctx context.Context, interval time.Duration, request *DeviceAccessTokenRequest, caller TokenEndpointCaller) (*oidc.AccessTokenResponse, error) {
+	ctx, span := Tracer.Start(ctx, "PollDeviceAccessTokenEndpoint")
+	defer span.End()
+
 	for {
 		timer := time.After(interval)
 		select {

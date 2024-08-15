@@ -5,15 +5,15 @@ import (
 	"errors"
 	"net/http"
 
-	httphelper "github.com/zitadel/oidc/v2/pkg/http"
-	"github.com/zitadel/oidc/v2/pkg/oidc"
+	httphelper "github.com/zitadel/oidc/v3/pkg/http"
+	"github.com/zitadel/oidc/v3/pkg/oidc"
 )
 
 type Introspector interface {
 	Decoder() httphelper.Decoder
 	Crypto() Crypto
 	Storage() Storage
-	AccessTokenVerifier(context.Context) AccessTokenVerifier
+	AccessTokenVerifier(context.Context) *AccessTokenVerifier
 }
 
 type IntrospectorJWTProfile interface {
@@ -28,6 +28,10 @@ func introspectionHandler(introspector Introspector) func(http.ResponseWriter, *
 }
 
 func Introspect(w http.ResponseWriter, r *http.Request, introspector Introspector) {
+	ctx, span := tracer.Start(r.Context(), "Introspect")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	response := new(oidc.IntrospectionResponse)
 	token, clientID, err := ParseTokenIntrospectionRequest(r, introspector)
 	if err != nil {
@@ -64,4 +68,9 @@ func ParseTokenIntrospectionRequest(r *http.Request, introspector Introspector) 
 	}
 
 	return req.Token, clientID, nil
+}
+
+type IntrospectionRequest struct {
+	*ClientCredentials
+	*oidc.IntrospectionRequest
 }

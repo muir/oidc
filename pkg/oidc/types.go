@@ -3,27 +3,28 @@ package oidc
 import (
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
 	"time"
 
-	"github.com/gorilla/schema"
+	jose "github.com/go-jose/go-jose/v4"
 	"github.com/muhlemmer/gu"
+	"github.com/zitadel/schema"
 	"golang.org/x/text/language"
-	"gopkg.in/square/go-jose.v2"
 )
 
 type Audience []string
 
 func (a *Audience) UnmarshalJSON(text []byte) error {
-	var i interface{}
+	var i any
 	err := json.Unmarshal(text, &i)
 	if err != nil {
 		return err
 	}
 	switch aud := i.(type) {
-	case []interface{}:
+	case []any:
 		*a = make([]string, len(aud))
 		for i, audience := range aud {
 			(*a)[i] = audience.(string)
@@ -76,8 +77,23 @@ func (l *Locale) MarshalJSON() ([]byte, error) {
 	return json.Marshal(tag)
 }
 
+// UnmarshalJSON implements json.Unmarshaler.
+// When [language.ValueError] is encountered, the containing tag will be set
+// to an empty value (language "und") and no error will be returned.
+// This state can be checked with the `l.Tag().IsRoot()` method.
 func (l *Locale) UnmarshalJSON(data []byte) error {
-	return json.Unmarshal(data, &l.tag)
+	err := json.Unmarshal(data, &l.tag)
+	if err == nil {
+		return nil
+	}
+
+	// catch "well-formed but unknown" errors
+	var target language.ValueError
+	if errors.As(err, &target) {
+		l.tag = language.Tag{}
+		return nil
+	}
+	return err
 }
 
 type Locales []language.Tag
@@ -151,7 +167,7 @@ type ResponseType string
 
 type ResponseMode string
 
-func (s SpaceDelimitedArray) Encode() string {
+func (s SpaceDelimitedArray) String() string {
 	return strings.Join(s, " ")
 }
 
@@ -161,11 +177,11 @@ func (s *SpaceDelimitedArray) UnmarshalText(text []byte) error {
 }
 
 func (s SpaceDelimitedArray) MarshalText() ([]byte, error) {
-	return []byte(s.Encode()), nil
+	return []byte(s.String()), nil
 }
 
 func (s SpaceDelimitedArray) MarshalJSON() ([]byte, error) {
-	return json.Marshal((s).Encode())
+	return json.Marshal((s).String())
 }
 
 func (s *SpaceDelimitedArray) UnmarshalJSON(data []byte) error {
@@ -177,7 +193,7 @@ func (s *SpaceDelimitedArray) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func (s *SpaceDelimitedArray) Scan(src interface{}) error {
+func (s *SpaceDelimitedArray) Scan(src any) error {
 	if src == nil {
 		*s = nil
 		return nil
@@ -210,7 +226,7 @@ func (s SpaceDelimitedArray) Value() (driver.Value, error) {
 func NewEncoder() *schema.Encoder {
 	e := schema.NewEncoder()
 	e.RegisterEncoder(SpaceDelimitedArray{}, func(value reflect.Value) string {
-		return value.Interface().(SpaceDelimitedArray).Encode()
+		return value.Interface().(SpaceDelimitedArray).String()
 	})
 	return e
 }

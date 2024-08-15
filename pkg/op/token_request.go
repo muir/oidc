@@ -2,11 +2,12 @@ package op
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"net/url"
 
-	httphelper "github.com/zitadel/oidc/v2/pkg/http"
-	"github.com/zitadel/oidc/v2/pkg/oidc"
+	httphelper "github.com/zitadel/oidc/v3/pkg/http"
+	"github.com/zitadel/oidc/v3/pkg/oidc"
 )
 
 type Exchanger interface {
@@ -20,18 +21,26 @@ type Exchanger interface {
 	GrantTypeJWTAuthorizationSupported() bool
 	GrantTypeClientCredentialsSupported() bool
 	GrantTypeDeviceCodeSupported() bool
-	AccessTokenVerifier(context.Context) AccessTokenVerifier
-	IDTokenHintVerifier(context.Context) IDTokenHintVerifier
+	AccessTokenVerifier(context.Context) *AccessTokenVerifier
+	IDTokenHintVerifier(context.Context) *IDTokenHintVerifier
+	Logger() *slog.Logger
 }
 
 func tokenHandler(exchanger Exchanger) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		Exchange(w, r, exchanger)
+		ctx, span := tracer.Start(r.Context(), "tokenHandler")
+		defer span.End()
+
+		Exchange(w, r.WithContext(ctx), exchanger)
 	}
 }
 
 // Exchange performs a token exchange appropriate for the grant type
 func Exchange(w http.ResponseWriter, r *http.Request, exchanger Exchanger) {
+	ctx, span := tracer.Start(r.Context(), "Exchange")
+	r = r.WithContext(ctx)
+	defer span.End()
+
 	grantType := r.FormValue("grant_type")
 	switch grantType {
 	case string(oidc.GrantTypeCode):
@@ -63,10 +72,10 @@ func Exchange(w http.ResponseWriter, r *http.Request, exchanger Exchanger) {
 			return
 		}
 	case "":
-		RequestError(w, r, oidc.ErrInvalidRequest().WithDescription("grant_type missing"))
+		RequestError(w, r, oidc.ErrInvalidRequest().WithDescription("grant_type missing"), exchanger.Logger())
 		return
 	}
-	RequestError(w, r, oidc.ErrUnsupportedGrantType().WithDescription("%s not supported", grantType))
+	RequestError(w, r, oidc.ErrUnsupportedGrantType().WithDescription("%s not supported", grantType), exchanger.Logger())
 }
 
 // AuthenticatedTokenRequest is a helper interface for ParseAuthenticatedTokenRequest
@@ -79,6 +88,10 @@ type AuthenticatedTokenRequest interface {
 // ParseAuthenticatedTokenRequest parses the client_id and client_secret from the HTTP request from either
 // HTTP Basic Auth header or form body and sets them into the provided authenticatedTokenRequest interface
 func ParseAuthenticatedTokenRequest(r *http.Request, decoder httphelper.Decoder, request AuthenticatedTokenRequest) error {
+	ctx, span := tracer.Start(r.Context(), "ParseAuthenticatedTokenRequest")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	err := r.ParseForm()
 	if err != nil {
 		return oidc.ErrInvalidRequest().WithDescription("error parsing form").WithParent(err)
@@ -106,6 +119,9 @@ func ParseAuthenticatedTokenRequest(r *http.Request, decoder httphelper.Decoder,
 
 // AuthorizeClientIDSecret authorizes a client by validating the client_id and client_secret (Basic Auth and POST)
 func AuthorizeClientIDSecret(ctx context.Context, clientID, clientSecret string, storage Storage) error {
+	ctx, span := tracer.Start(ctx, "AuthorizeClientIDSecret")
+	defer span.End()
+
 	err := storage.AuthorizeClientIDSecret(ctx, clientID, clientSecret)
 	if err != nil {
 		return oidc.ErrInvalidClient().WithDescription("invalid client_id / client_secret").WithParent(err)
@@ -115,11 +131,11 @@ func AuthorizeClientIDSecret(ctx context.Context, clientID, clientSecret string,
 
 // AuthorizeCodeChallenge authorizes a client by validating the code_verifier against the previously sent
 // code_challenge of the auth request (PKCE)
-func AuthorizeCodeChallenge(tokenReq *oidc.AccessTokenRequest, challenge *oidc.CodeChallenge) error {
-	if tokenReq.CodeVerifier == "" {
+func AuthorizeCodeChallenge(codeVerifier string, challenge *oidc.CodeChallenge) error {
+	if codeVerifier == "" {
 		return oidc.ErrInvalidRequest().WithDescription("code_challenge required")
 	}
-	if !oidc.VerifyCodeChallenge(challenge, tokenReq.CodeVerifier) {
+	if !oidc.VerifyCodeChallenge(challenge, codeVerifier) {
 		return oidc.ErrInvalidGrant().WithDescription("invalid code challenge")
 	}
 	return nil
@@ -128,6 +144,9 @@ func AuthorizeCodeChallenge(tokenReq *oidc.AccessTokenRequest, challenge *oidc.C
 // AuthorizePrivateJWTKey authorizes a client by validating the client_assertion's signature with a previously
 // registered public key (JWT Profile)
 func AuthorizePrivateJWTKey(ctx context.Context, clientAssertion string, exchanger JWTAuthorizationGrantExchanger) (Client, error) {
+	ctx, span := tracer.Start(ctx, "AuthorizePrivateJWTKey")
+	defer span.End()
+
 	jwtReq, err := VerifyJWTAssertion(ctx, clientAssertion, exchanger.JWTProfileVerifier(ctx))
 	if err != nil {
 		return nil, err

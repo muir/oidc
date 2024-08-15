@@ -2,19 +2,22 @@ package op
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"path"
 
-	httphelper "github.com/zitadel/oidc/v2/pkg/http"
-	"github.com/zitadel/oidc/v2/pkg/oidc"
+	httphelper "github.com/zitadel/oidc/v3/pkg/http"
+	"github.com/zitadel/oidc/v3/pkg/oidc"
 )
 
 type SessionEnder interface {
 	Decoder() httphelper.Decoder
 	Storage() Storage
-	IDTokenHintVerifier(context.Context) IDTokenHintVerifier
+	IDTokenHintVerifier(context.Context) *IDTokenHintVerifier
 	DefaultLogoutRedirectURI() string
+	Logger() *slog.Logger
 }
 
 func endSessionHandler(ender SessionEnder) func(http.ResponseWriter, *http.Request) {
@@ -24,6 +27,10 @@ func endSessionHandler(ender SessionEnder) func(http.ResponseWriter, *http.Reque
 }
 
 func EndSession(w http.ResponseWriter, r *http.Request, ender SessionEnder) {
+	ctx, span := tracer.Start(r.Context(), "EndSession")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	req, err := ParseEndSessionRequest(r, ender.Decoder())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -31,7 +38,7 @@ func EndSession(w http.ResponseWriter, r *http.Request, ender SessionEnder) {
 	}
 	session, err := ValidateEndSessionRequest(r.Context(), req, ender)
 	if err != nil {
-		RequestError(w, r, err)
+		RequestError(w, r, err, ender.Logger())
 		return
 	}
 	redirect := session.RedirectURI
@@ -41,7 +48,7 @@ func EndSession(w http.ResponseWriter, r *http.Request, ender SessionEnder) {
 		err = ender.Storage().TerminateSession(r.Context(), session.UserID, session.ClientID)
 	}
 	if err != nil {
-		RequestError(w, r, oidc.DefaultToServerError(err, "error terminating session"))
+		RequestError(w, r, oidc.DefaultToServerError(err, "error terminating session"), ender.Logger())
 		return
 	}
 	http.Redirect(w, r, redirect, http.StatusFound)
@@ -61,12 +68,15 @@ func ParseEndSessionRequest(r *http.Request, decoder httphelper.Decoder) (*oidc.
 }
 
 func ValidateEndSessionRequest(ctx context.Context, req *oidc.EndSessionRequest, ender SessionEnder) (*EndSessionRequest, error) {
+	ctx, span := tracer.Start(ctx, "ValidateEndSessionRequest")
+	defer span.End()
+
 	session := &EndSessionRequest{
 		RedirectURI: ender.DefaultLogoutRedirectURI(),
 	}
 	if req.IdTokenHint != "" {
 		claims, err := VerifyIDTokenHint[*oidc.IDTokenClaims](ctx, req.IdTokenHint, ender.IDTokenHintVerifier(ctx))
-		if err != nil {
+		if err != nil && !errors.As(err, &IDTokenHintExpiredError{}) {
 			return nil, oidc.ErrInvalidRequest().WithDescription("id_token_hint invalid").WithParent(err)
 		}
 		session.UserID = claims.GetSubject()

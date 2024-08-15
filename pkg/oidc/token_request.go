@@ -3,9 +3,10 @@ package oidc
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 
-	"gopkg.in/square/go-jose.v2"
+	jose "github.com/go-jose/go-jose/v4"
 )
 
 const (
@@ -57,13 +58,7 @@ var AllTokenTypes = []TokenType{
 type TokenType string
 
 func (t TokenType) IsSupported() bool {
-	for _, tt := range AllTokenTypes {
-		if t == tt {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(AllTokenTypes, t)
 }
 
 type TokenRequest interface {
@@ -130,7 +125,7 @@ type JWTTokenRequest struct {
 	IssuedAt  Time                `json:"iat"`
 	ExpiresAt Time                `json:"exp"`
 
-	private map[string]interface{}
+	private map[string]any
 }
 
 func (j *JWTTokenRequest) MarshalJSON() ([]byte, error) {
@@ -171,7 +166,7 @@ func (j *JWTTokenRequest) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func (j *JWTTokenRequest) GetCustomClaim(key string) interface{} {
+func (j *JWTTokenRequest) GetCustomClaim(key string) any {
 	return j.private[key]
 }
 

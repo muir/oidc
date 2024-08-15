@@ -5,36 +5,40 @@ import (
 	"net/http"
 	"time"
 
-	httphelper "github.com/zitadel/oidc/v2/pkg/http"
-	"github.com/zitadel/oidc/v2/pkg/oidc"
+	httphelper "github.com/zitadel/oidc/v3/pkg/http"
+	"github.com/zitadel/oidc/v3/pkg/oidc"
 )
 
 type JWTAuthorizationGrantExchanger interface {
 	Exchanger
-	JWTProfileVerifier(context.Context) JWTProfileVerifier
+	JWTProfileVerifier(context.Context) *JWTProfileVerifier
 }
 
 // JWTProfile handles the OAuth 2.0 JWT Profile Authorization Grant https://tools.ietf.org/html/rfc7523#section-2.1
 func JWTProfile(w http.ResponseWriter, r *http.Request, exchanger JWTAuthorizationGrantExchanger) {
+	ctx, span := tracer.Start(r.Context(), "JWTProfile")
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	profileRequest, err := ParseJWTProfileGrantRequest(r, exchanger.Decoder())
 	if err != nil {
-		RequestError(w, r, err)
+		RequestError(w, r, err, exchanger.Logger())
 	}
 
 	tokenRequest, err := VerifyJWTAssertion(r.Context(), profileRequest.Assertion, exchanger.JWTProfileVerifier(r.Context()))
 	if err != nil {
-		RequestError(w, r, err)
+		RequestError(w, r, err, exchanger.Logger())
 		return
 	}
 
 	tokenRequest.Scopes, err = exchanger.Storage().ValidateJWTProfileScopes(r.Context(), tokenRequest.Issuer, profileRequest.Scope)
 	if err != nil {
-		RequestError(w, r, err)
+		RequestError(w, r, err, exchanger.Logger())
 		return
 	}
 	resp, err := CreateJWTTokenResponse(r.Context(), tokenRequest, exchanger)
 	if err != nil {
-		RequestError(w, r, err)
+		RequestError(w, r, err, exchanger.Logger())
 		return
 	}
 	httphelper.MarshalJSON(w, resp)
@@ -56,6 +60,9 @@ func ParseJWTProfileGrantRequest(r *http.Request, decoder httphelper.Decoder) (*
 // CreateJWTTokenResponse creates an access_token response for a JWT Profile Grant request
 // by default the access_token is an opaque string, but can be specified by implementing the JWTProfileTokenStorage interface
 func CreateJWTTokenResponse(ctx context.Context, tokenRequest TokenRequest, creator TokenCreator) (*oidc.AccessTokenResponse, error) {
+	ctx, span := tracer.Start(ctx, "CreateJWTTokenResponse")
+	defer span.End()
+
 	// return an opaque token as default to not break current implementations
 	tokenType := AccessTokenTypeBearer
 

@@ -2,13 +2,14 @@ package op
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	tu "github.com/zitadel/oidc/v2/internal/testutil"
-	"github.com/zitadel/oidc/v2/pkg/oidc"
+	tu "github.com/zitadel/oidc/v3/internal/testutil"
+	"github.com/zitadel/oidc/v3/pkg/oidc"
 )
 
 func TestNewIDTokenHintVerifier(t *testing.T) {
@@ -20,7 +21,7 @@ func TestNewIDTokenHintVerifier(t *testing.T) {
 	tests := []struct {
 		name string
 		args args
-		want IDTokenHintVerifier
+		want *IDTokenHintVerifier
 	}{
 		{
 			name: "simple",
@@ -28,9 +29,9 @@ func TestNewIDTokenHintVerifier(t *testing.T) {
 				issuer: tu.ValidIssuer,
 				keySet: tu.KeySet{},
 			},
-			want: &idTokenHintVerifier{
-				issuer: tu.ValidIssuer,
-				keySet: tu.KeySet{},
+			want: &IDTokenHintVerifier{
+				Issuer: tu.ValidIssuer,
+				KeySet: tu.KeySet{},
 			},
 		},
 		{
@@ -42,10 +43,10 @@ func TestNewIDTokenHintVerifier(t *testing.T) {
 					WithSupportedIDTokenHintSigningAlgorithms("ABC", "DEF"),
 				},
 			},
-			want: &idTokenHintVerifier{
-				issuer:            tu.ValidIssuer,
-				keySet:            tu.KeySet{},
-				supportedSignAlgs: []string{"ABC", "DEF"},
+			want: &IDTokenHintVerifier{
+				Issuer:            tu.ValidIssuer,
+				KeySet:            tu.KeySet{},
+				SupportedSignAlgs: []string{"ABC", "DEF"},
 			},
 		},
 	}
@@ -57,35 +58,44 @@ func TestNewIDTokenHintVerifier(t *testing.T) {
 	}
 }
 
+func Test_IDTokenHintExpiredError(t *testing.T) {
+	var err error = IDTokenHintExpiredError{oidc.ErrExpired}
+	assert.True(t, errors.Unwrap(err) == oidc.ErrExpired)
+	assert.ErrorIs(t, err, oidc.ErrExpired)
+	assert.ErrorAs(t, err, &IDTokenHintExpiredError{})
+}
+
 func TestVerifyIDTokenHint(t *testing.T) {
-	verifier := &idTokenHintVerifier{
-		issuer:            tu.ValidIssuer,
-		maxAgeIAT:         2 * time.Minute,
-		offset:            time.Second,
-		supportedSignAlgs: []string{string(tu.SignatureAlgorithm)},
-		maxAge:            2 * time.Minute,
-		acr:               tu.ACRVerify,
-		keySet:            tu.KeySet{},
+	verifier := &IDTokenHintVerifier{
+		Issuer:            tu.ValidIssuer,
+		MaxAgeIAT:         2 * time.Minute,
+		Offset:            time.Second,
+		SupportedSignAlgs: []string{string(tu.SignatureAlgorithm)},
+		MaxAge:            2 * time.Minute,
+		ACR:               tu.ACRVerify,
+		KeySet:            tu.KeySet{},
 	}
 
 	tests := []struct {
 		name        string
 		tokenClaims func() (string, *oidc.IDTokenClaims)
-		wantErr     bool
+		wantClaims  bool
+		wantErr     error
 	}{
 		{
 			name:        "success",
 			tokenClaims: tu.ValidIDToken,
+			wantClaims:  true,
 		},
 		{
 			name:        "parse err",
 			tokenClaims: func() (string, *oidc.IDTokenClaims) { return "~~~~", nil },
-			wantErr:     true,
+			wantErr:     oidc.ErrParse,
 		},
 		{
 			name:        "invalid signature",
 			tokenClaims: func() (string, *oidc.IDTokenClaims) { return tu.InvalidSignatureToken, nil },
-			wantErr:     true,
+			wantErr:     oidc.ErrSignatureUnsupportedAlg,
 		},
 		{
 			name: "wrong issuer",
@@ -96,29 +106,7 @@ func TestVerifyIDTokenHint(t *testing.T) {
 					tu.ValidACR, tu.ValidAMR, tu.ValidClientID, tu.ValidSkew, "",
 				)
 			},
-			wantErr: true,
-		},
-		{
-			name: "expired",
-			tokenClaims: func() (string, *oidc.IDTokenClaims) {
-				return tu.NewIDToken(
-					tu.ValidIssuer, tu.ValidSubject, tu.ValidAudience,
-					tu.ValidExpiration.Add(-time.Hour), tu.ValidAuthTime, tu.ValidNonce,
-					tu.ValidACR, tu.ValidAMR, tu.ValidClientID, tu.ValidSkew, "",
-				)
-			},
-			wantErr: true,
-		},
-		{
-			name: "wrong IAT",
-			tokenClaims: func() (string, *oidc.IDTokenClaims) {
-				return tu.NewIDToken(
-					tu.ValidIssuer, tu.ValidSubject, tu.ValidAudience,
-					tu.ValidExpiration, tu.ValidAuthTime, tu.ValidNonce,
-					tu.ValidACR, tu.ValidAMR, tu.ValidClientID, -time.Hour, "",
-				)
-			},
-			wantErr: true,
+			wantErr: oidc.ErrIssuerInvalid,
 		},
 		{
 			name: "wrong acr",
@@ -129,7 +117,31 @@ func TestVerifyIDTokenHint(t *testing.T) {
 					"else", tu.ValidAMR, tu.ValidClientID, tu.ValidSkew, "",
 				)
 			},
-			wantErr: true,
+			wantErr: oidc.ErrAcrInvalid,
+		},
+		{
+			name: "expired",
+			tokenClaims: func() (string, *oidc.IDTokenClaims) {
+				return tu.NewIDToken(
+					tu.ValidIssuer, tu.ValidSubject, tu.ValidAudience,
+					tu.ValidExpiration.Add(-time.Hour), tu.ValidAuthTime, tu.ValidNonce,
+					tu.ValidACR, tu.ValidAMR, tu.ValidClientID, tu.ValidSkew, "",
+				)
+			},
+			wantClaims: true,
+			wantErr:    IDTokenHintExpiredError{oidc.ErrExpired},
+		},
+		{
+			name: "IAT too old",
+			tokenClaims: func() (string, *oidc.IDTokenClaims) {
+				return tu.NewIDToken(
+					tu.ValidIssuer, tu.ValidSubject, tu.ValidAudience,
+					tu.ValidExpiration, tu.ValidAuthTime, tu.ValidNonce,
+					tu.ValidACR, tu.ValidAMR, tu.ValidClientID, time.Hour, "",
+				)
+			},
+			wantClaims: true,
+			wantErr:    IDTokenHintExpiredError{oidc.ErrIatToOld},
 		},
 		{
 			name: "expired auth",
@@ -140,7 +152,8 @@ func TestVerifyIDTokenHint(t *testing.T) {
 					tu.ValidACR, tu.ValidAMR, tu.ValidClientID, tu.ValidSkew, "",
 				)
 			},
-			wantErr: true,
+			wantClaims: true,
+			wantErr:    IDTokenHintExpiredError{oidc.ErrAuthTimeToOld},
 		},
 	}
 	for _, tt := range tests {
@@ -148,14 +161,12 @@ func TestVerifyIDTokenHint(t *testing.T) {
 			token, want := tt.tokenClaims()
 
 			got, err := VerifyIDTokenHint[*oidc.IDTokenClaims](context.Background(), token, verifier)
-			if tt.wantErr {
-				assert.Error(t, err)
-				assert.Nil(t, got)
+			require.ErrorIs(t, err, tt.wantErr)
+			if tt.wantClaims {
+				assert.Equal(t, got, want, "claims")
 				return
 			}
-			require.NoError(t, err)
-			require.NotNil(t, got)
-			assert.Equal(t, got, want)
+			assert.Nil(t, got, "claims")
 		})
 	}
 }
