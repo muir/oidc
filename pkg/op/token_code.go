@@ -2,6 +2,7 @@ package op
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 
 	httphelper "github.com/zitadel/oidc/v3/pkg/http"
@@ -76,6 +77,7 @@ func AuthorizeCodeClient(ctx context.Context, tokenReq *oidc.AccessTokenRequest,
 
 	request, err = AuthRequestByCode(ctx, exchanger.Storage(), tokenReq.Code)
 	if err != nil {
+		exchanger.Logger().Log(ctx, slog.LevelWarn, "XXX could not find authrequest", "error", err.Error())
 		return nil, nil, err
 	}
 
@@ -84,6 +86,7 @@ func AuthorizeCodeClient(ctx context.Context, tokenReq *oidc.AccessTokenRequest,
 		err = AuthorizeCodeChallenge(tokenReq.CodeVerifier, codeChallenge)
 
 		if err != nil {
+			exchanger.Logger().Log(ctx, slog.LevelWarn, "XXX code challenge failed", "error", err.Error())
 			return nil, nil, err
 		}
 	}
@@ -91,10 +94,12 @@ func AuthorizeCodeClient(ctx context.Context, tokenReq *oidc.AccessTokenRequest,
 	if tokenReq.ClientAssertionType == oidc.ClientAssertionTypeJWTAssertion {
 		jwtExchanger, ok := exchanger.(JWTAuthorizationGrantExchanger)
 		if !ok || !exchanger.AuthMethodPrivateKeyJWTSupported() {
+			exchanger.Logger().Log(ctx, slog.LevelWarn, "XXX jwtExchanger not ok")
 			return nil, nil, oidc.ErrInvalidClient().WithDescription("auth_method private_key_jwt not supported")
 		}
 		client, err = AuthorizePrivateJWTKey(ctx, tokenReq.ClientAssertion, jwtExchanger)
 		if err != nil {
+			exchanger.Logger().Log(ctx, slog.LevelWarn, "XXX jwtExchanger failed", "error", err.Error())
 			return nil, nil, err
 		}
 		return request, client, err
@@ -102,22 +107,27 @@ func AuthorizeCodeClient(ctx context.Context, tokenReq *oidc.AccessTokenRequest,
 
 	client, err = exchanger.Storage().GetClientByClientID(ctx, tokenReq.ClientID)
 	if err != nil {
+		exchanger.Logger().Log(ctx, slog.LevelWarn, "XXX get client failed", "error", err.Error())
 		return nil, nil, oidc.ErrInvalidClient().WithParent(err)
 	}
 	if client.AuthMethod() == oidc.AuthMethodPrivateKeyJWT {
+		exchanger.Logger().Log(ctx, slog.LevelWarn, "XXX jwt not allowed")
 		return nil, nil, oidc.ErrInvalidClient().WithDescription("private_key_jwt not allowed for this client")
 	}
 	if client.AuthMethod() == oidc.AuthMethodNone {
 		if codeChallenge == nil {
+			exchanger.Logger().Log(ctx, slog.LevelWarn, "XXX no pkce", "error", err.Error())
 			return nil, nil, oidc.ErrInvalidRequest().WithDescription("PKCE required")
 		}
 		return request, client, nil
 	}
 	if client.AuthMethod() == oidc.AuthMethodPost && !exchanger.AuthMethodPostSupported() {
+		exchanger.Logger().Log(ctx, slog.LevelWarn, "XXX method post not supported")
 		return nil, nil, oidc.ErrInvalidClient().WithDescription("auth_method post not supported")
 	}
 	err = AuthorizeClientIDSecret(ctx, tokenReq.ClientID, tokenReq.ClientSecret, exchanger.Storage())
 	if err != nil {
+		exchanger.Logger().Log(ctx, slog.LevelWarn, "XXX ID secret failed", "error", err.Error())
 		return nil, nil, err
 	}
 
